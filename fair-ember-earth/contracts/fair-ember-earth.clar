@@ -14,6 +14,8 @@
 (define-constant ERR_INSUFFICIENT_STAKE (err u1010))
 (define-constant ERR_RESOURCE_ALREADY_DEPLOYED (err u1011))
 (define-constant ERR_INVALID_DISASTER_TYPE (err u1012))
+(define-constant ERR_CACHE_NOT_FOUND (err u1013))
+(define-constant ERR_CERTIFICATE_NOT_FOUND (err u1014))
 
 ;; Contract owner
 (define-constant CONTRACT_OWNER tx-sender)
@@ -23,6 +25,8 @@
 (define-constant ORACLE_CONSENSUS_THRESHOLD u3) ;; Minimum oracle confirmations
 (define-constant MAX_DISASTER_RADIUS u10000) ;; Maximum disaster radius in meters
 (define-constant IMPACT_REWARD_MULTIPLIER u150) ;; 1.5x reward multiplier for impact
+(define-constant MAX_SEVERITY_LEVEL u10)
+(define-constant BLOCKS_PER_DAY u144) ;; Approximately 24 hours
 
 ;; Data structures
 (define-map disasters
@@ -36,7 +40,8 @@
         funds-allocated: uint,
         status: (string-ascii 16),
         activation-block: uint,
-        response-deadline: uint
+        response-deadline: uint,
+        reporter: principal
     }
 )
 
@@ -113,6 +118,11 @@
     }
 )
 
+(define-map disaster-oracle-consensus
+    { disaster-id: uint }
+    { confirmation-count: uint }
+)
+
 ;; Global state variables
 (define-data-var disaster-counter uint u0)
 (define-data-var certificate-counter uint u0)
@@ -154,8 +164,21 @@
 )
 
 (define-private (get-oracle-confirmations (disaster-id uint))
-    ;; Simplified oracle confirmation count
-    u3 ;; This would iterate through oracle-reports in a full implementation
+    (default-to u0 (get confirmation-count (map-get? disaster-oracle-consensus { disaster-id: disaster-id })))
+)
+
+(define-private (increment-oracle-confirmations (disaster-id uint))
+    (let ((current-count (get-oracle-confirmations disaster-id)))
+        (map-set disaster-oracle-consensus 
+            { disaster-id: disaster-id }
+            { confirmation-count: (+ current-count u1) }
+        )
+    )
+)
+
+;; Calculate reward based on impact
+(define-private (calculate-impact-reward (impact-score uint) (base-amount uint))
+    (/ (* base-amount impact-score IMPACT_REWARD_MULTIPLIER) u10000)
 )
 
 ;; Admin Functions
@@ -172,6 +195,15 @@
         (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
         (asserts! (<= level u5) ERR_INVALID_THRESHOLD)
         (var-set global-alert-level level)
+        (ok true)
+    )
+)
+
+(define-public (add-emergency-funds (amount uint))
+    (begin
+        (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set total-emergency-funds (+ (var-get total-emergency-funds) amount))
         (ok true)
     )
 )
@@ -199,7 +231,7 @@
     )
 )
 
-;; Public Functions
+;; Responder Functions
 (define-public (become-certified-responder (stake-amount uint) (geographic-radius uint))
     (begin
         (asserts! (var-get system-active) ERR_NOT_AUTHORIZED)
@@ -227,7 +259,7 @@
             (asserts! (var-get system-active) ERR_NOT_AUTHORIZED)
             (asserts! (is-certified-responder tx-sender) ERR_RESPONDER_NOT_CERTIFIED)
             (asserts! (is-valid-coordinates latitude longitude) ERR_INVALID_COORDINATES)
-            (asserts! (<= severity u10) ERR_INVALID_THRESHOLD)
+            (asserts! (<= severity MAX_SEVERITY_LEVEL) ERR_INVALID_THRESHOLD)
             (map-set disasters
                 { disaster-id: disaster-id }
                 {
@@ -239,7 +271,8 @@
                     funds-allocated: u0,
                     status: "reported",
                     activation-block: block-height,
-                    response-deadline: (+ block-height u144) ;; 24 hours
+                    response-deadline: (+ block-height BLOCKS_PER_DAY),
+                    reporter: tx-sender
                 }
             )
             (var-set disaster-counter disaster-id)
@@ -272,7 +305,7 @@
 (define-public (deploy-resources (disaster-id uint) (cache-id uint) (quantity uint))
     (let (
         (disaster (unwrap! (map-get? disasters { disaster-id: disaster-id }) ERR_DISASTER_NOT_FOUND))
-        (cache (unwrap! (map-get? resource-caches { cache-id: cache-id }) ERR_DISASTER_NOT_FOUND))
+        (cache (unwrap! (map-get? resource-caches { cache-id: cache-id }) ERR_CACHE_NOT_FOUND))
     )
         (begin
             (asserts! (var-get system-active) ERR_NOT_AUTHORIZED)
@@ -296,4 +329,126 @@
         (begin
             (asserts! (var-get system-active) ERR_NOT_AUTHORIZED)
             (asserts! (is-certified-responder tx-sender) ERR_RESPONDER_NOT_CERTIFIED)
-            (asserts
+            (asserts! (is-some (map-get? disasters { disaster-id: disaster-id })) ERR_DISASTER_NOT_FOUND)
+            (asserts! (<= impact-score u100) ERR_INVALID_IMPACT_DATA)
+            (map-set impact-certificates
+                { certificate-id: certificate-id }
+                {
+                    disaster-id: disaster-id,
+                    responder: tx-sender,
+                    impact-score: impact-score,
+                    beneficiaries-helped: beneficiaries,
+                    resources-deployed: resources-used,
+                    verification-status: "pending",
+                    oracle-confirmations: u0,
+                    reward-amount: u0
+                }
+            )
+            (var-set certificate-counter certificate-id)
+            (ok certificate-id)
+        )
+    )
+)
+
+(define-public (submit-oracle-report (disaster-id uint) (severity uint) (damage-estimate uint) (population-affected uint) (urgent-needs (string-ascii 64)))
+    (begin
+        (asserts! (var-get system-active) ERR_NOT_AUTHORIZED)
+        (asserts! (is-some (map-get? disasters { disaster-id: disaster-id })) ERR_DISASTER_NOT_FOUND)
+        (asserts! (<= severity MAX_SEVERITY_LEVEL) ERR_INVALID_THRESHOLD)
+        (map-set oracle-reports
+            { oracle-id: tx-sender, disaster-id: disaster-id }
+            {
+                severity-assessment: severity,
+                damage-estimate: damage-estimate,
+                population-affected: population-affected,
+                urgent-needs: urgent-needs,
+                report-timestamp: block-height,
+                confidence-level: u80
+            }
+        )
+        (increment-oracle-confirmations disaster-id)
+        (ok true)
+    )
+)
+
+(define-public (verify-impact-certificate (certificate-id uint))
+    (let (
+        (certificate (unwrap! (map-get? impact-certificates { certificate-id: certificate-id }) ERR_CERTIFICATE_NOT_FOUND))
+        (disaster-id (get disaster-id certificate))
+        (disaster (unwrap! (map-get? disasters { disaster-id: disaster-id }) ERR_DISASTER_NOT_FOUND))
+        (reward (calculate-impact-reward (get impact-score certificate) (get funds-allocated disaster)))
+    )
+        (begin
+            (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+            (asserts! (is-eq (get verification-status certificate) "pending") ERR_ALREADY_ACTIVATED)
+            (map-set impact-certificates
+                { certificate-id: certificate-id }
+                (merge certificate {
+                    verification-status: "verified",
+                    oracle-confirmations: ORACLE_CONSENSUS_THRESHOLD,
+                    reward-amount: reward
+                })
+            )
+            ;; Transfer reward to responder
+            (try! (as-contract (stx-transfer? reward tx-sender (get responder certificate))))
+            (ok true)
+        )
+    )
+)
+
+(define-public (update-responder-stats (responder principal) (responses uint) (success-rate uint))
+    (let ((current-data (unwrap! (map-get? certified-responders { responder: responder }) ERR_RESPONDER_NOT_CERTIFIED)))
+        (begin
+            (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+            (asserts! (<= success-rate u100) ERR_INVALID_THRESHOLD)
+            (map-set certified-responders
+                { responder: responder }
+                (merge current-data {
+                    total-responses: responses,
+                    success-rate: success-rate
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Read-only functions
+(define-read-only (get-disaster-info (disaster-id uint))
+    (map-get? disasters { disaster-id: disaster-id })
+)
+
+(define-read-only (get-responder-info (responder principal))
+    (map-get? certified-responders { responder: responder })
+)
+
+(define-read-only (get-resource-cache (cache-id uint))
+    (map-get? resource-caches { cache-id: cache-id })
+)
+
+(define-read-only (get-impact-certificate (certificate-id uint))
+    (map-get? impact-certificates { certificate-id: certificate-id })
+)
+
+(define-read-only (get-system-status)
+    {
+        system-active: (var-get system-active),
+        total-disasters: (var-get disaster-counter),
+        total-certificates: (var-get certificate-counter),
+        total-caches: (var-get cache-counter),
+        emergency-funds: (var-get total-emergency-funds),
+        global-alert-level: (var-get global-alert-level)
+    }
+)
+
+(define-read-only (get-oracle-report (oracle-id principal) (disaster-id uint))
+    (map-get? oracle-reports { oracle-id: oracle-id, disaster-id: disaster-id })
+)
+
+(define-read-only (get-community-resilience (region-id uint))
+    (map-get? community-resilience-data { region-id: region-id })
+)
+
+(define-read-only (is-disaster-consensus-reached (disaster-id uint))
+    (validate-oracle-consensus disaster-id)
+)
